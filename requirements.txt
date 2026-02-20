@@ -1,0 +1,15 @@
+passlib==1.7.4
+pydantic_settings==2.12.0
+python_jose==3.5.0
+sqlmodel==0.0.31
+fastapi
+uvicorn[standard]
+python-multipart
+alembic
+psycopg2-binary
+asyncpg
+python-dotenv
+cryptography
+argon2-cffi
+email-validator
+resend
