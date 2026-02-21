@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 import enum
 
 
-# Enums 
+# ─── Enums ────────────────────────────────────────────────────────────────────
 
 class UserType(str, enum.Enum):
     PATIENT = "PATIENT"
@@ -22,7 +22,7 @@ class UserType(str, enum.Enum):
 
 
 class RoleName(str, enum.Enum):
-    SUPER_ADMIN = "SUPER_ADMIN"       # Platform-wide admin 
+    SUPER_ADMIN = "SUPER_ADMIN"       # Platform-wide admin (Anthropic-style)
     TENANT_ADMIN = "TENANT_ADMIN"     # Pharmacy company admin (super-admin within tenant)
     STORE_MANAGER = "STORE_MANAGER"   # Branch manager
     PHARMACIST = "PHARMACIST"
@@ -32,7 +32,7 @@ class RoleName(str, enum.Enum):
     PATIENT = "PATIENT"               # Customer
 
 
-# Base mixins 
+# ─── Base mixins ──────────────────────────────────────────────────────────────
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -44,7 +44,7 @@ class TimestampMixin(SQLModel):
     deleted_at: Optional[datetime] = Field(default=None, nullable=True)
 
 
-# Tenants
+# ─── Tenants ──────────────────────────────────────────────────────────────────
 
 class Tenant(TimestampMixin, table=True):
     """Represents a pharmacy company (the top-level tenant)."""
@@ -65,7 +65,7 @@ class Tenant(TimestampMixin, table=True):
     user_roles: List["UserRole"] = Relationship(back_populates="tenant")
 
 
-# Pharmacy Stores
+# ─── Pharmacy Stores ──────────────────────────────────────────────────────────
 
 class PharmacyStore(TimestampMixin, table=True):
     """Physical branch / location of a pharmacy."""
@@ -90,7 +90,7 @@ class PharmacyStore(TimestampMixin, table=True):
     staff_profiles: List["StaffProfile"] = Relationship(back_populates="store")
 
 
-# Users 
+# ─── Users ────────────────────────────────────────────────────────────────────
 
 class User(TimestampMixin, table=True):
     """
@@ -139,7 +139,7 @@ class User(TimestampMixin, table=True):
         return " ".join(p for p in parts if p)
 
 
-# Roles
+# ─── Roles ────────────────────────────────────────────────────────────────────
 
 class Role(SQLModel, table=True):
     """System-defined roles. Seeded at startup."""
@@ -153,7 +153,7 @@ class Role(SQLModel, table=True):
     user_roles: List["UserRole"] = Relationship(back_populates="role")
 
 
-# User Roles (junction — scoped per tenant + optional store) 
+# ─── User Roles (junction — scoped per tenant + optional store) ───────────────
 
 class UserRole(TimestampMixin, table=True):
     """
@@ -174,14 +174,17 @@ class UserRole(TimestampMixin, table=True):
     # Relationships
     user: Optional[User] = Relationship(
         back_populates="user_roles",
-        sa_relationship_kwargs={"foreign_keys": "[UserRole.user_id]"},
+        sa_relationship_kwargs={
+            "foreign_keys": "UserRole.user_id",
+            "primaryjoin": "UserRole.user_id == User.id",
+        },
     )
     role: Optional[Role] = Relationship(back_populates="user_roles")
     tenant: Optional[Tenant] = Relationship(back_populates="user_roles")
     store: Optional[PharmacyStore] = Relationship(back_populates="user_roles")
 
 
-# Staff Profiles
+# ─── Staff Profiles ───────────────────────────────────────────────────────────
 
 class StaffProfile(TimestampMixin, table=True):
     """Additional profile data for pharmacy staff."""
@@ -198,11 +201,17 @@ class StaffProfile(TimestampMixin, table=True):
     verified_by: Optional[UUID] = Field(default=None, foreign_key="users.id")
 
     # Relationships
-    user: Optional[User] = Relationship(back_populates="staff_profile")
+    user: Optional[User] = Relationship(
+        back_populates="staff_profile",
+        sa_relationship_kwargs={
+            "foreign_keys": "StaffProfile.user_id",
+            "primaryjoin": "StaffProfile.user_id == User.id",
+        },
+    )
     store: Optional[PharmacyStore] = Relationship(back_populates="staff_profiles")
 
 
-# Password Reset Tokens 
+# ─── Password Reset Tokens ────────────────────────────────────────────────────
 
 class PasswordResetToken(TimestampMixin, table=True):
     __tablename__ = "password_reset_tokens"  # type: ignore
@@ -220,7 +229,7 @@ class PasswordResetToken(TimestampMixin, table=True):
     user: Optional[User] = Relationship(back_populates="password_reset_tokens")
 
 
-# Refresh Tokens
+# ─── Refresh Tokens ───────────────────────────────────────────────────────────
 
 class RefreshToken(TimestampMixin, table=True):
     __tablename__ = "refresh_tokens"  # type: ignore

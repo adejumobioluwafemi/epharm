@@ -15,6 +15,11 @@ Fixture hierarchy:
     valid_reset_token, expired_reset_token, used_reset_token
     valid_refresh_token
 """
+import sys
+import os
+
+# Guarantee project root is on sys.path (belt-and-suspenders alongside pytest.ini pythonpath)
+sys.path.insert(0, os.path.dirname(__file__))
 
 import hashlib
 import pytest
@@ -807,4 +812,3 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "security: Security and edge-case tests")
     config.addinivalue_line("markers", "unit: Unit tests (no HTTP client)")
     config.addinivalue_line("markers", "integration: Full HTTP stack integration tests")
-    config.addinivalue_line("markers", "asyncio: Async tests")

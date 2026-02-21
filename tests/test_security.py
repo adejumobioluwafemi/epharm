@@ -208,7 +208,9 @@ class TestCreateAndDecodeAccessToken:
         assert payload["tenant_id"] is None # type: ignore
 
     def test_token_contains_correct_issuer_and_audience(self):
-        """iss and aud claims must match epharm-api / epharm-frontend."""
+        """iss and aud claims must match the configured JWT_ISSUER / JWT_AUDIENCE."""
+        from src.core.config import settings as app_settings
+
         token = create_access_token(
             user_id=uuid4(),
             email="x@x.com",
@@ -216,8 +218,8 @@ class TestCreateAndDecodeAccessToken:
         )
         payload = decode_access_token(token)
 
-        assert payload["iss"] == "epharm-api" # type: ignore
-        assert payload["aud"] == "epharm-frontend" # type: ignore
+        assert payload["iss"] == app_settings.JWT_ISSUER # type: ignore
+        assert payload["aud"] == app_settings.JWT_AUDIENCE # type: ignore
 
     def test_expired_token_returns_none(self):
         """A token with a negative expiry must be rejected."""
@@ -303,10 +305,11 @@ class TestCreateAndDecodeRefreshToken:
         assert decode_refresh_token("garbage.token.here") is None
 
     def test_two_refresh_tokens_for_same_user_are_different(self):
-        """Each call must produce a unique token (different iat/exp values)."""
+        """Each call must produce a unique token (different exp values).
+        JWT timestamps have 1-second resolution so we sleep >1s between calls."""
         user_id = uuid4()
         token1 = create_refresh_token_jwt(user_id=user_id)
-        time.sleep(0.05)
+        time.sleep(1.1)  # JWT iat/exp have 1-second precision — must wait >1 second
         token2 = create_refresh_token_jwt(user_id=user_id)
 
         assert token1 != token2

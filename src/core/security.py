@@ -9,15 +9,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from uuid import UUID
 
-from jose import JWTError, jwt  
-from passlib.context import CryptContext  
+from jose import JWTError, jwt  # type: ignore
+from passlib.context import CryptContext  # type: ignore
 
 from src.core.config import settings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-# Password Hashing 
+# ─── Password Hashing ────────────────────────────────────────────────────────
 
 def generate_salt() -> str:
     """Generate a cryptographically secure random salt (hex string)."""
@@ -27,17 +27,21 @@ def generate_salt() -> str:
 def hash_password(plain_password: str, salt: str) -> str:
     """
     Hash password using bcrypt after salting.
-    We prepend the salt to the password before hashing so that
-    even if two users share a password the hashes differ.
+    We prepend the salt to the password and SHA-256 the result first so that
+    the input to bcrypt is always exactly 64 bytes — safely within bcrypt's
+    72-byte limit regardless of password length.
     """
     salted = f"{salt}{plain_password}"
-    return pwd_context.hash(salted)
+    # SHA-256 digest is 64 hex chars = 64 bytes, always within bcrypt's 72-byte limit
+    digest = hashlib.sha256(salted.encode()).hexdigest()
+    return pwd_context.hash(digest)
 
 
 def verify_password(plain_password: str, salt: str, hashed_password: str) -> bool:
     """Verify a plain password against its stored salt + bcrypt hash."""
     salted = f"{salt}{plain_password}"
-    return pwd_context.verify(salted, hashed_password)
+    digest = hashlib.sha256(salted.encode()).hexdigest()
+    return pwd_context.verify(digest, hashed_password)
 
 
 def generate_temp_password(length: int = 12) -> str:
@@ -46,7 +50,7 @@ def generate_temp_password(length: int = 12) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
-# Token Generation
+# ─── Token Generation ─────────────────────────────────────────────────────────
 
 def generate_reset_token() -> str:
     """Generate a URL-safe secure random token for password reset."""
@@ -58,7 +62,7 @@ def generate_refresh_token() -> str:
     return secrets.token_urlsafe(64)
 
 
-# JWT
+# ─── JWT ─────────────────────────────────────────────────────────────────────
 
 def create_access_token(
     *,
@@ -120,7 +124,7 @@ def create_refresh_token_jwt(
     expire = now + (
         expires_delta
         if expires_delta
-        else timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS) # type: ignore
+        else timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS)
     )
     payload = {
         "sub": str(user_id),
