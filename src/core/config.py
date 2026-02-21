@@ -128,6 +128,7 @@ class Settings:
         self.JWT_ACCESS_TOKEN_EXPIRE_MINUTES = get_int_env("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 10080)
         self.JWT_ISSUER = os.getenv("JWT_ISSUER", "ronaex-api")
         self.JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "ronaex-frontend")
+        self.JWT_REFRESH_TOKEN_EXPIRE_DAYS = os.getenv("JWT_REFRESH_TOKEN_EXPIRE_DAYS", 1)
         
         # Password Reset
         self.PASSWORD_RESET_TOKEN_EXPIRE_HOURS = get_int_env("PASSWORD_RESET_TOKEN_EXPIRE_HOURS", 24)

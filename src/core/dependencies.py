@@ -1,380 +1,228 @@
 """
 FILE: src/core/dependencies.py
-FastAPI dependencies for authentication and authorization
+FastAPI dependencies — tenant-aware authentication & RBAC
 """
+
 from fastapi import Depends, HTTPException, status, Header, Request
 from sqlmodel import Session, select
-from typing import Optional
+from typing import List, Optional
+from uuid import UUID
+
 from src.core.database import get_session
 from src.core.security import decode_access_token
-from src.shared.models import Useraccount, Userprofile
+from src.shared.models import User, UserRole, Role
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-async def get_current_user(
-    authorization: Optional[str] = Header(None),
-    session: Session = Depends(get_session)
-) -> Useraccount:
-    """
-    Get current authenticated user from JWT token
-    
-    Validates token and returns user object
-    Raises 401 if token is invalid or user not found
-    """
+# Token extraction 
+
+def _extract_token(authorization: Optional[str]) -> str:
     if not authorization:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header format",
+        )
+    return parts[1]
+
+
+# Current user 
+
+async def get_current_user(
+    authorization: Optional[str] = Header(None),
+    session: Session = Depends(get_session),
+) -> User:
+    """
+    Validate Bearer token and return the authenticated User.
+    Raises 401 on invalid token, 403 on locked/inactive account.
+    """
+    token = _extract_token(authorization)
+    payload = decode_access_token(token)
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+        )
+
+    user_id_str = payload.get("sub")
+    if not user_id_str:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload",
+        )
+
     try:
-        scheme, token = authorization.split()
-        if scheme.lower() != "bearer":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authentication scheme"
-            )
+        user_id = UUID(user_id_str)
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization header format"
+            detail="Invalid token payload",
         )
-    
-    token_data = decode_access_token(token)
-    if not token_data:
+
+    user = session.get(User, user_id)
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials"
+            detail="User not found",
         )
-    
-    user_id = token_data.get("UserId")
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload"
-        )
-    
-    user = session.get(Useraccount, user_id)
-    if not user or user.status != 1 or user.islocked:
+
+    if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account is not accessible"
+            detail="Account is deactivated",
         )
-    
-    if user.apitoken != token:
+
+    if user.is_locked:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is locked. Contact your administrator.",
+        )
+
+    # Token revocation check — stored token must match
+    if user.api_token != token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has been revoked"
+            detail="Token has been revoked. Please log in again.",
         )
-    
+
     return user
 
 
 async def get_current_active_user(
-    current_user: Useraccount = Depends(get_current_user)
-) -> Useraccount:
-    """
-    Get current active user
-    
-    Additional check for user activity status
-    """
-    if not current_user.isactive:
+    current_user: User = Depends(get_current_user),
+) -> User:
+    if not current_user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is not active"
+            detail="Inactive account",
         )
-    
     return current_user
-
-
-async def get_current_user_profile(
-    current_user: Useraccount = Depends(get_current_user),
-    session: Session = Depends(get_session)
-) -> Optional[Userprofile]:
-    """
-    Get current user's profile
-    
-    Returns user profile or None if not found
-    """
-    statement = select(Userprofile).where(Userprofile.userid == current_user.userid)
-    profile = session.exec(statement).first()
-    
-    return profile
-
-
-def require_role(required_role_id: int):
-    """
-    Dependency factory for role-based access control
-    
-    Usage:
-        @router.get("/admin-only", dependencies=[Depends(require_role(1))])
-    """
-    async def role_checker(
-        current_user: Useraccount = Depends(get_current_user),
-        session: Session = Depends(get_session)
-    ):
-        # Get user profile to check role
-        statement = select(Userprofile).where(Userprofile.userid == current_user.userid)
-        profile = session.exec(statement).first()
-        
-        if not profile or profile.roleid != required_role_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Insufficient permissions"
-            )
-        
-        return current_user
-    
-    return role_checker
-
-
-def require_admin():
-    """
-    Require admin role (roleid = 1)
-    
-    Usage:
-        @router.post("/create", dependencies=[Depends(require_admin())])
-    """
-    return require_role(1)
-
-
-def require_officer():
-    """
-    Require extension officer role (roleid = 2)
-    
-    Usage:
-        @router.post("/farmer", dependencies=[Depends(require_officer())])
-    """
-    return require_role(2)
 
 
 async def get_optional_current_user(
     authorization: Optional[str] = Header(None),
-    session: Session = Depends(get_session)
-) -> Optional[Useraccount]:
-    """
-    Get current user if authenticated, None otherwise
-    
-    Useful for endpoints that work both authenticated and unauthenticated
-    """
+    session: Session = Depends(get_session),
+) -> Optional[User]:
+    """Returns the current user or None (for public+auth endpoints)."""
     try:
         if not authorization:
             return None
-        
-        scheme, token = authorization.split()
-        if scheme.lower() != "bearer":
+        token = _extract_token(authorization)
+        payload = decode_access_token(token)
+        if not payload:
             return None
-        
-        token_data = decode_access_token(token)
-        if not token_data:
+        user_id = UUID(payload.get("sub", ""))
+        user = session.get(User, user_id)
+        if not user or not user.is_active or user.is_locked:
             return None
-        
-        user_id = token_data.get("UserId")
-        if not user_id:
-            return None
-        
-        user = session.get(Useraccount, user_id)
-        if not user or user.status != 1 or user.islocked:
-            return None
-        
         return user
     except Exception:
         return None
 
 
-def pagination_params(
-    skip: int = 0,
-    limit: int = 100
-) -> dict:
-    """
-    Common pagination parameters
-    
-    Usage:
-        @router.get("/list")
-        async def get_list(pagination: dict = Depends(pagination_params)):
-            skip = pagination["skip"]
-            limit = pagination["limit"]
-    """
-    if skip < 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Skip must be >= 0"
-        )
-    
-    if limit < 1 or limit > 1000:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Limit must be between 1 and 1000"
-        )
-    
-    return {"skip": skip, "limit": limit}
+# Tenant context 
 
+class TenantContext:
+    """
+    Extracts tenant_id and store_ids from the JWT payload and
+    exposes them for downstream use. Enforces that tenant-scoped
+    endpoints are accessed only by users belonging to that tenant.
+    """
 
-class CurrentUserInfo:
-    """
-    Helper class to get current user information
-    
-    Usage:
-        @router.get("/me")
-        async def get_me(user_info: CurrentUserInfo = Depends()):
-            return {
-                "user_id": user_info.user_id,
-                "is_admin": user_info.is_admin()
-            }
-    """
     def __init__(
         self,
-        current_user: Useraccount = Depends(get_current_user),
-        session: Session = Depends(get_session)
+        authorization: Optional[str] = Header(None),
+        current_user: User = Depends(get_current_user),
     ):
         self.user = current_user
-        self.session = session
-        self._profile = None
-    
-    @property
-    def user_id(self) -> int:
-        """Get user ID"""
-        return self.user.userid  # type: ignore
-    
-    @property
-    def username(self) -> str:
-        """Get username"""
-        return self.user.username  # type: ignore
-    
-    @property
-    def email(self) -> Optional[str]:
-        """Get email"""
-        return self.user.email
-    
-    @property
-    def profile(self) -> Optional[Userprofile]:
-        """Get user profile (cached)"""
-        if self._profile is None:
-            statement = select(Userprofile).where(
-                Userprofile.userid == self.user.userid
+        payload = decode_access_token(_extract_token(authorization)) or {}
+        tenant_id_str = payload.get("tenant_id")
+        store_ids_str: List[str] = payload.get("store_ids", [])
+        self.roles: List[str] = payload.get("roles", [])
+        self.tenant_id: Optional[UUID] = UUID(tenant_id_str) if tenant_id_str else None
+        self.store_ids: List[UUID] = [UUID(s) for s in store_ids_str if s]
+
+    def require_tenant(self) -> UUID:
+        """Raises 403 if the user has no tenant context (e.g. unauthenticated SUPER_ADMIN path)."""
+        if not self.tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tenant context required",
             )
-            self._profile = self.session.exec(statement).first()
-        
-        return self._profile
-    
-    @property
-    def role_id(self) -> Optional[int]:
-        """Get role ID from profile"""
-        profile = self.profile
-        return profile.roleid if profile else None
-    
-    @property
-    def lga_id(self) -> Optional[int]:
-        """Get LGA ID"""
-        return self.user.lgaid
-    
-    @property
-    def firstname(self) -> Optional[str]:
-        """Get first name from profile"""
-        profile = self.profile
-        return profile.firstname if profile else None
-    
-    @property
-    def lastname(self) -> Optional[str]:
-        """Get last name from profile"""
-        profile = self.profile
-        return profile.lastname if profile else None
-    
-    @property
-    def fullname(self) -> str:
-        """Get full name"""
-        profile = self.profile
-        if profile:
-            parts = []
-            if profile.firstname:
-                parts.append(profile.firstname)
-            if profile.middlename:
-                parts.append(profile.middlename)
-            if profile.lastname:
-                parts.append(profile.lastname)
-            return " ".join(parts) if parts else self.username
-        return self.username
-    
-    def is_admin(self) -> bool:
-        """Check if user is admin (roleid = 1)"""
-        return self.role_id == 1
-    
-    def is_officer(self) -> bool:
-        """Check if user is extension officer (roleid = 2)"""
-        return self.role_id == 2
-    
-    def has_role(self, role_id: int) -> bool:
-        """Check if user has specific role"""
-        return self.role_id == role_id
-    
-    def can_access_lga(self, lga_id: int) -> bool:
-        """Check if user can access specific LGA"""
-        # Admin can access all LGAs
-        if self.is_admin():
+        return self.tenant_id
+
+    def has_role(self, role_name: str) -> bool:
+        return role_name in self.roles
+
+    def is_super_admin(self) -> bool:
+        return "SUPER_ADMIN" in self.roles
+
+    def can_access_store(self, store_id: UUID) -> bool:
+        if self.is_super_admin():
             return True
-        
-        # Officers can only access their assigned LGA
-        return self.lga_id == lga_id
-    
-    def to_dict(self) -> dict:
-        """Convert to dictionary"""
-        return {
-            "user_id": self.user_id,
-            "username": self.username,
-            "email": self.email,
-            "fullname": self.fullname,
-            "role_id": self.role_id,
-            "lga_id": self.lga_id,
-            "is_admin": self.is_admin(),
-            "is_officer": self.is_officer()
-        }
+        return store_id in self.store_ids
 
 
-def get_user_from_request(request: Request) -> Optional[Useraccount]:
+# RBAC dependency factories 
+
+def require_roles(*role_names: str):
     """
-    Extract user from request state (if set by middleware)
-    
-    Usage in middleware:
-        request.state.user = current_user
+    Dependency factory: user must have at least one of the given role names.
+
+    Usage:
+        @router.get("/admin", dependencies=[Depends(require_roles("SUPER_ADMIN", "STORE_MANAGER"))])
     """
-    return getattr(request.state, "user", None)
+    async def checker(
+        authorization: Optional[str] = Header(None),
+        current_user: User = Depends(get_current_user),
+        session: Session = Depends(get_session),
+    ) -> User:
+        payload = decode_access_token(_extract_token(authorization)) or {}
+        user_roles: List[str] = payload.get("roles", [])
+        if not any(r in user_roles for r in role_names):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Requires one of roles: {list(role_names)}",
+            )
+        return current_user
+
+    return checker
 
 
-async def verify_resource_access(
-    resource_lga_id: Optional[int],
-    current_user: Useraccount = Depends(get_current_user),
-    session: Session = Depends(get_session)
-) -> bool:
+def require_super_admin():
+    return require_roles("SUPER_ADMIN")
+
+
+def require_tenant_admin():
+    return require_roles("SUPER_ADMIN", "TENANT_ADMIN")
+
+
+def require_store_manager():
+    return require_roles("SUPER_ADMIN", "TENANT_ADMIN", "STORE_MANAGER")
+
+
+def require_staff():
+    return require_roles("SUPER_ADMIN", "TENANT_ADMIN", "STORE_MANAGER", "PHARMACIST", "CASHIER")
+
+
+# Pagination 
+
+def pagination_params(page: int = 1, page_size: int = 20) -> dict:
     """
-    Verify if user can access a resource based on LGA
-    
-    Args:
-        resource_lga_id: LGA ID of the resource
-        current_user: Current authenticated user
-        session: Database session
-        
-    Returns:
-        bool: True if access is allowed
-        
-    Raises:
-        HTTPException: If access is denied
+    Standard pagination parameters.
+    Returns {skip, limit, page, page_size}.
     """
-    # Get user profile
-    statement = select(Userprofile).where(Userprofile.userid == current_user.userid)
-    profile = session.exec(statement).first()
-    
-    # Admin has access to all resources
-    if profile and profile.roleid == 1:
-        return True
-    
-    # Officers can only access resources in their LGA
-    if resource_lga_id and current_user.lgaid != resource_lga_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You don't have access to resources in this LGA"
-        )
-    
-    return True
+    if page < 1:
+        raise HTTPException(status_code=400, detail="page must be >= 1")
+    if page_size < 1 or page_size > 200:
+        raise HTTPException(status_code=400, detail="page_size must be between 1 and 200")
+    skip = (page - 1) * page_size
+    return {"skip": skip, "limit": page_size, "page": page, "page_size": page_size}

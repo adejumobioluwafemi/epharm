@@ -1,7 +1,8 @@
 """
 FILE: main.py
-FastAPI application entry point
+E-Pharmacy Multi-Tenant API Entry Point
 """
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -12,17 +13,17 @@ import os
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     logger.info("=" * 60)
-    logger.info("🚀 Ronaex API")
+    logger.info("🏥 Ronaex Multi-Tenant API")
     logger.info("=" * 60)
-    
     try:
         init_db()
         logger.info("✅ Database initialized")
@@ -32,9 +33,7 @@ async def lifespan(app: FastAPI):
             raise
     logger.info("✅ Application ready!")
     yield
-    
     logger.info("🛑 Shutting down")
-    
     try:
         close_db()
         logger.info("✅ DB connections closed")
@@ -45,7 +44,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    description="Ronaex E-Pharmacy API",
+    description="Ronaex Multi-Tenant API — Secure, Tenant-Isolated",
     lifespan=lifespan,
     docs_url="/docs" if settings.ENVIRONMENT == "development" else None,
     redoc_url="/redoc" if settings.ENVIRONMENT == "development" else None,
@@ -59,13 +58,14 @@ app.add_middleware(
     allow_headers=settings.CORS_ALLOW_HEADERS,
 )
 
+
 @app.get("/")
 async def root():
     return {
         "message": f"Welcome to {settings.APP_NAME}",
         "version": settings.APP_VERSION,
         "docs": "/docs",
-        "environment": settings.ENVIRONMENT
+        "environment": settings.ENVIRONMENT,
     }
 
 
@@ -76,19 +76,20 @@ async def health_check():
 
 try:
     from src.auth.router import router as auth_router
-    app.include_router(auth_router, prefix=settings.API_V1_PREFIX, tags=["Authentication"])
+    app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
     logger.info("✅ Auth router registered")
-except ImportError:
-    logger.warning("⚠️  Auth router not found")
+except ImportError as e:
+    logger.warning(f"⚠️ Auth router not found: {e}")
 
+try:
+    from src.users.router import router as users_router
+    app.include_router(users_router, prefix=settings.API_V1_PREFIX)
+    logger.info("✅ Users router registered")
+except ImportError as e:
+    logger.warning(f"⚠️ Users router not found: {e}")
 
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", settings.PORT))
-    uvicorn.run(
-        "main:app",
-        host=settings.HOST,
-        port=port,
-        reload=settings.RELOAD
-    )
+    uvicorn.run("main:app", host=settings.HOST, port=port, reload=settings.RELOAD)

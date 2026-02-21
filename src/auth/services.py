@@ -1,529 +1,566 @@
 """
 FILE: src/auth/services.py
-Authentication business logic - Updated to support email/username login
+Authentication service — tenant-aware, RBAC, bcrypt+salt
 """
-from sqlmodel import Session, select, func, or_
-from sqlalchemy import and_
-from src.shared.models import (
-    Useraccount, Userprofile, PasswordResetToken,
-    Address, Userregion, Lga, Region
-)
-from src.shared.schemas import (
-    LoginRequest, UserCreate,
-    ForgotPasswordRequest, ResetPasswordRequest
-)
-from src.core.security import (
-    simple_encrypt, simple_decrypt, generate_salt,
-    create_access_token, generate_reset_token, generate_default_password
-)
-from src.core.config import settings
-from datetime import datetime, timedelta
+
+import hashlib
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import UUID
+
 from fastapi import HTTPException, status
-from typing import Optional, List, Dict, Any, Tuple
+from sqlalchemy import and_
+from sqlmodel import Session, select
+
+from src.core.config import settings
+from src.core.security import (
+    create_access_token,
+    create_refresh_token_jwt,
+    decode_refresh_token,
+    generate_reset_token,
+    generate_salt,
+    generate_temp_password,
+    hash_password,
+    verify_password,
+)
+from src.shared.models import (
+    PasswordResetToken,
+    PharmacyStore,
+    RefreshToken,
+    Role,
+    StaffProfile,
+    Tenant,
+    User,
+    UserRole,
+    UserType,
+    utcnow,
+)
+from src.auth.schemas import (
+    AssignRoleRequest,
+    LoginRequest,
+    LoginResponse,
+    RegisterStaffRequest,
+    TokenResponse,
+    UserBasicInfo,
+)
 import logging
 
 logger = logging.getLogger(__name__)
 
+MAX_FAILED_ATTEMPTS = 5
+BCRYPT_REFRESH_HASH = hashlib.sha256  # used to hash raw refresh tokens before DB storage
+
+
+def _hash_token(raw: str) -> str:
+    return hashlib.sha256(raw.encode()).hexdigest()
+
 
 class AuthService:
-    """Authentication service - handles all auth business logic"""
-    
-    # LOGIN & LOGOUT
+    """All authentication and token business logic."""
+
+    # User lookup helpers 
+
     @staticmethod
-    async def authenticate_user(
-        credentials: LoginRequest,
-        session: Session
-    ) -> Dict[str, Any]:
-        """
-        Authenticate user and return token with user info
-        
-        Supports login with either username OR email
-        
-        Returns:
-            Dict with token and user data
-            
-        Raises:
-            HTTPException: On authentication failure
-        """
-        # Find user by username OR email
-        # Check if input looks like an email (contains @)
-        login_identifier = credentials.username
-        is_email = '@' in login_identifier
-        
-        if is_email:
-            # Search by email
-            user = session.exec(
-                select(Useraccount).where(Useraccount.email == login_identifier)
-            ).first()
-            logger.info(f"Login attempt with email: {login_identifier}")
-        else:
-            # Search by username
-            user = session.exec(
-                select(Useraccount).where(Useraccount.username == login_identifier)
-            ).first()
-            logger.info(f"Login attempt with username: {login_identifier}")
-        
-        if not user:
-            logger.warning(f"Login attempt - invalid credential: {login_identifier}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid username/email or password"
-            )
-        
-        # Check account locked
-        if user.islocked:
-            logger.warning(f"Login attempt - locked account: {login_identifier}")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Account is locked. Contact administrator."
-            )
-        
-        # Check account status
-        if user.status != 1:
-            logger.warning(f"Login attempt - inactive account: {login_identifier}")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Account is disabled"
-            )
-        
-        # Verify password
-        if not user.passwordhash or not user.salt:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid username/email or password"
-            )
-        
-        try:
-            decrypted_password = simple_decrypt(user.passwordhash, user.salt)
-            
-            if credentials.password != decrypted_password:
-                # Increment failed attempts
-                user.failedloginattempt = (user.failedloginattempt or 0) + 1
-                
-                # Lock after 5 failed attempts
-                if user.failedloginattempt >= 5:
-                    user.islocked = True
-                    session.add(user)
-                    session.commit()
-                    logger.warning(f"Account locked - too many failed attempts: {login_identifier}")
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Account locked due to multiple failed login attempts"
-                    )
-                
-                session.add(user)
-                session.commit()
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid username/email or password"
-                )
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid username/email or password"
-            )
-        
-        # Get profile
-        profile = session.exec(
-            select(Userprofile).where(Userprofile.userid == user.userid)
-        ).first()
-        
-        # Generate JWT
-        token_data = {
-            "UserId": user.userid,
-            "UserName": user.username,
-            "UserStatus": user.status,
-            "Email": user.email
-        }
-        access_token = create_access_token(data=token_data)
-        
-        # Update login info
-        user.logincount = (user.logincount or 0) + 1
-        user.apitoken = access_token
-        user.isactive = True
-        user.lastlogindate = datetime.utcnow().date()
-        user.failedloginattempt = 0
-        user.updatedat = datetime.utcnow()
-        
-        session.add(user)
-        session.commit()
-        
-        logger.info(f"Successful login: {user.username} (via {('email' if is_email else 'username')})")
-        
+    def _find_user_by_identifier(identifier: str, session: Session) -> Optional[User]:
+        """Find user by email or phone."""
+        if "@" in identifier:
+            return session.exec(select(User).where(User.email == identifier.lower().strip())).first()
+        return session.exec(select(User).where(User.phone == identifier.strip())).first()
+
+    @staticmethod
+    def _build_jwt_context(user: User, session: Session) -> Dict[str, Any]:
+        """Collect tenant_id, store_ids, and role names for JWT payload."""
+        user_roles = session.exec(
+            select(UserRole).where(UserRole.user_id == user.id)
+        ).all()
+
+        # Collect unique tenant ids (usually 1 for staff, none for SUPER_ADMIN)
+        tenant_ids = list({ur.tenant_id for ur in user_roles if ur.tenant_id})
+        store_ids = [ur.store_id for ur in user_roles if ur.store_id]
+
+        # Collect role names
+        role_ids = [ur.role_id for ur in user_roles]
+        roles: List[str] = []
+        if role_ids:
+            db_roles = session.exec(select(Role).where(Role.id.in_(role_ids))).all()  # type: ignore
+            roles = [r.name for r in db_roles]
+
+        tenant_id = tenant_ids[0] if tenant_ids else None
         return {
-            "token": access_token,
-            "user": {
-                "userid": user.userid,
-                "username": user.username,
-                "email": user.email,
-                "firstname": profile.firstname if profile else None,
-                "lastname": profile.lastname if profile else None,
-                "roleid": profile.roleid if profile else None,
-                "lgaid": user.lgaid
-            }
+            "tenant_id": tenant_id,
+            "store_ids": store_ids,
+            "roles": roles,
         }
-    
+
     @staticmethod
-    async def logout_user(user: Useraccount, session: Session) -> None:
-        """Logout user - clear token and set inactive"""
-        user.apitoken = None
-        user.isactive = False
-        user.updatedat = datetime.utcnow()
-        
+    def _build_user_info(user: User, ctx: Dict) -> UserBasicInfo:
+        return UserBasicInfo(
+            id=user.id,
+            email=user.email,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            user_type=user.user_type,
+            tenant_id=ctx["tenant_id"],
+            store_ids=ctx["store_ids"],
+            roles=ctx["roles"],
+        )
+
+    # Login / Logout 
+
+    @staticmethod
+    async def login(req: LoginRequest, session: Session, request_meta: Dict) -> LoginResponse:
+        """
+        Authenticate user. Returns access + refresh tokens.
+        Locks account after MAX_FAILED_ATTEMPTS failures.
+        """
+        user = AuthService._find_user_by_identifier(req.identifier, session)
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+            )
+
+        if user.is_locked:
+            logger.warning(f"Login attempt on locked account: {req.identifier}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account locked. Contact your administrator.",
+            )
+
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is deactivated.",
+            )
+
+        # Verify password
+        if not verify_password(req.password, user.salt, user.password_hash):
+            user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
+            if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
+                user.is_locked = True
+                logger.warning(f"Account locked — too many failures: {req.identifier}")
+            user.updated_at = utcnow()
+            session.add(user)
+            session.commit()
+
+            detail = (
+                "Account locked due to multiple failed login attempts"
+                if user.is_locked
+                else "Invalid credentials"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN if user.is_locked else status.HTTP_401_UNAUTHORIZED,
+                detail=detail,
+            )
+
+        # Build token context
+        ctx = AuthService._build_jwt_context(user, session)
+
+        # Issue tokens
+        access_token = create_access_token(
+            user_id=user.id,
+            email=user.email,
+            user_type=user.user_type,
+            tenant_id=ctx["tenant_id"],
+            store_ids=ctx["store_ids"],
+            roles=ctx["roles"],
+        )
+        raw_refresh = create_refresh_token_jwt(user_id=user.id)
+
+        # Persist refresh token
+        expires_at = utcnow() + timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS) # type: ignore
+        refresh_record = RefreshToken(
+            user_id=user.id,
+            token_hash=_hash_token(raw_refresh),
+            expires_at=expires_at,
+            ip_address=request_meta.get("ip"),
+            user_agent=request_meta.get("user_agent"),
+        )
+        session.add(refresh_record)
+
+        # Update user
+        user.api_token = access_token
+        user.login_count = (user.login_count or 0) + 1
+        user.last_login_at = utcnow()
+        user.failed_login_attempts = 0
+        user.updated_at = utcnow()
         session.add(user)
         session.commit()
-        
-        logger.info(f"User logged out: {user.username}")
-    
-    # PASSWORD RESET
+
+        logger.info(f"Login successful: {user.email}")
+
+        return LoginResponse(
+            token=TokenResponse(
+                access_token=access_token,
+                refresh_token=raw_refresh,
+                expires_in=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+            ),
+            user=AuthService._build_user_info(user, ctx),
+        )
+
+    @staticmethod
+    async def logout(user: User, session: Session) -> None:
+        """Revoke access token and all refresh tokens."""
+        user.api_token = None
+        user.updated_at = utcnow()
+        session.add(user)
+
+        # Revoke all refresh tokens
+        refresh_tokens = session.exec(
+            select(RefreshToken).where(
+                and_(
+                    RefreshToken.user_id == user.id,  # type: ignore
+                    RefreshToken.is_revoked == False,  # type: ignore
+                )
+            )
+        ).all()
+        for rt in refresh_tokens:
+            rt.is_revoked = True
+            rt.revoked_at = utcnow()
+            session.add(rt)
+
+        session.commit()
+        logger.info(f"User logged out: {user.email}")
+
+    @staticmethod
+    async def refresh_tokens(
+        raw_refresh_token: str, session: Session, request_meta: Dict
+    ) -> TokenResponse:
+        """Rotate refresh token and issue new access token."""
+        user_id_str = decode_refresh_token(raw_refresh_token)
+        if not user_id_str:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+
+        token_hash = _hash_token(raw_refresh_token)
+        now = utcnow()
+
+        stored = session.exec(
+            select(RefreshToken).where(
+                and_(
+                    RefreshToken.token_hash == token_hash,  # type: ignore
+                    RefreshToken.is_revoked == False,  # type: ignore
+                    RefreshToken.expires_at > now,  # type: ignore
+                )
+            )
+        ).first()
+
+        if not stored:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired or revoked")
+
+        user = session.get(User, UUID(user_id_str))
+        if not user or not user.is_active or user.is_locked:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not accessible")
+
+        # Revoke old token (rotation)
+        stored.is_revoked = True
+        stored.revoked_at = now
+        session.add(stored)
+
+        ctx = AuthService._build_jwt_context(user, session)
+        new_access = create_access_token(
+            user_id=user.id,
+            email=user.email,
+            user_type=user.user_type,
+            tenant_id=ctx["tenant_id"],
+            store_ids=ctx["store_ids"],
+            roles=ctx["roles"],
+        )
+        new_raw_refresh = create_refresh_token_jwt(user_id=user.id)
+
+        expires_at = now + timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS) # type: ignore
+        new_stored = RefreshToken(
+            user_id=user.id,
+            token_hash=_hash_token(new_raw_refresh),
+            expires_at=expires_at,
+            ip_address=request_meta.get("ip"),
+            user_agent=request_meta.get("user_agent"),
+        )
+        session.add(new_stored)
+
+        user.api_token = new_access
+        user.updated_at = now
+        session.add(user)
+        session.commit()
+
+        return TokenResponse(
+            access_token=new_access,
+            refresh_token=new_raw_refresh,
+            expires_in=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        )
+
+    # Password Reset
+
     @staticmethod
     async def request_password_reset(
-        email: str,
-        session: Session
-    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        email: str, session: Session, request_meta: Dict
+    ) -> Tuple[bool, Optional[Dict]]:
         """
-        Request password reset
-        
-        Returns:
-            (user_exists, email_data_if_exists)
+        Initiate password reset flow.
+        Returns (user_exists, email_data) — always returns success-shaped response to caller.
         """
-        user = session.exec(
-            select(Useraccount).where(Useraccount.email == email)
-        ).first()
-        
-        if not user or user.status != 1:
-            logger.info(f"Password reset - non-existent/inactive email: {email}")
-            return (False, None)
-        
-        # Get profile
-        profile = session.exec(
-            select(Userprofile).where(Userprofile.userid == user.userid)
-        ).first()
-        
-        # Generate token
-        reset_token = generate_reset_token()
-        expires_at = datetime.utcnow() + timedelta(hours=settings.PASSWORD_RESET_TOKEN_EXPIRE_HOURS)
-        
+        user = session.exec(select(User).where(User.email == email.lower().strip())).first()
+        if not user or not user.is_active:
+            return False, None
+
         # Invalidate old tokens
         old_tokens = session.exec(
             select(PasswordResetToken).where(
                 and_(
-                    PasswordResetToken.userid == user.userid, # type: ignore
-                    PasswordResetToken.isused == False # type: ignore
+                    PasswordResetToken.user_id == user.id,  # type: ignore
+                    PasswordResetToken.is_used == False,  # type: ignore
                 )
             )
         ).all()
-        
-        for old_token in old_tokens:
-            old_token.isused = True
-            old_token.updatedat = datetime.utcnow()
-            session.add(old_token)
-        
-        # Create new token
-        token_record = PasswordResetToken(
-            userid=user.userid,
-            token=reset_token,
-            expiresat=expires_at,
-            isused=False,
-            createdat=datetime.utcnow()
+        for ot in old_tokens:
+            ot.is_used = True
+            ot.updated_at = utcnow()
+            session.add(ot)
+
+        token = generate_reset_token()
+        expires_at = utcnow() + timedelta(hours=settings.PASSWORD_RESET_TOKEN_EXPIRE_HOURS)
+
+        reset_record = PasswordResetToken(
+            user_id=user.id,
+            token=token,
+            expires_at=expires_at,
+            ip_address=request_meta.get("ip"),
+            user_agent=request_meta.get("user_agent"),
         )
-        session.add(token_record)
-        
-        # Update user
-        user.passwordresettoken = reset_token
-        user.passwordresettokenexpires = expires_at
-        user.updatedat = datetime.utcnow()
-        session.add(user)
-        
+        session.add(reset_record)
         session.commit()
-        
-        logger.info(f"Password reset token generated for: {email}")
-        
-        # Return email data
-        email_data = {
-            "email": email,
-            "username": user.username,
-            "firstname": profile.firstname if profile else "User",
-            "reset_token": reset_token,
-            "expires_at": expires_at
+
+        logger.info(f"Password reset token issued for: {email}")
+
+        return True, {
+            "email": user.email,
+            "first_name": user.first_name or "User",
+            "full_name": user.full_name,
+            "reset_token": token,
+            "expires_at": expires_at,
         }
-        
-        return (True, email_data)
-    
-    @staticmethod
-    async def reset_password(
-        token: str,
-        new_password: str,
-        session: Session
-    ) -> None:
-        """Reset password using token"""
-        # Find valid token
-        token_record = session.exec(
-            select(PasswordResetToken).where(
-                and_(
-                    PasswordResetToken.token == token, # type: ignore
-                    PasswordResetToken.isused == False, # type: ignore
-                    PasswordResetToken.expiresat > datetime.utcnow() # type: ignore
-                )
-            )
-        ).first()
-        
-        if not token_record:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid or expired token"
-            )
-        
-        # Get user
-        user = session.get(Useraccount, token_record.userid)
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
-        
-        # Update password
-        salt = generate_salt()
-        encrypted_password = simple_encrypt(new_password, salt)
-        
-        user.salt = salt
-        user.passwordhash = encrypted_password
-        user.lastpasswordreset = datetime.utcnow()
-        user.passwordresettoken = None
-        user.passwordresettokenexpires = None
-        user.updatedat = datetime.utcnow()
-        user.failedloginattempt = 0
-        user.islocked = False
-        
-        # Mark token used
-        token_record.isused = True
-        token_record.usedat = datetime.utcnow()
-        token_record.updatedat = datetime.utcnow()
-        
-        session.add(user)
-        session.add(token_record)
-        session.commit()
-        
-        logger.info(f"Password reset successful for: {user.username}")
-    
+
     @staticmethod
     async def validate_reset_token(token: str, session: Session) -> bool:
-        """Check if reset token is valid"""
-        token_record = session.exec(
+        record = session.exec(
             select(PasswordResetToken).where(
                 and_(
-                    PasswordResetToken.token == token, # type: ignore
-                    PasswordResetToken.isused == False, # type: ignore
-                    PasswordResetToken.expiresat > datetime.utcnow() # type: ignore
+                    PasswordResetToken.token == token,  # type: ignore
+                    PasswordResetToken.is_used == False,  # type: ignore
+                    PasswordResetToken.expires_at > utcnow(),  # type: ignore
                 )
             )
         ).first()
-        
-        return token_record is not None
-    
-    # USER MANAGEMENT (ADMIN)
+        return record is not None
+
     @staticmethod
-    async def create_user(
-        user_data: UserCreate,
-        session: Session
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """
-        Create new user (extension officer)
-        
-        Returns:
-            (user_info, email_data)
-        """
-        # Generate username from email
-        username = user_data.emailAddress.split('@')[0]
-        
-        # Check username exists
-        if session.exec(select(Useraccount).where(Useraccount.username == username)).first():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Username already exists"
+    async def reset_password(token: str, new_password: str, session: Session) -> User:
+        record = session.exec(
+            select(PasswordResetToken).where(
+                and_(
+                    PasswordResetToken.token == token,  # type: ignore
+                    PasswordResetToken.is_used == False,  # type: ignore
+                    PasswordResetToken.expires_at > utcnow(),  # type: ignore
+                )
             )
-        
-        # Check email exists
-        if session.exec(select(Useraccount).where(Useraccount.email == user_data.emailAddress)).first():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email already exists"
-            )
-        
-        # Validate LGA
-        lga = session.get(Lga, user_data.lgaid)
-        if not lga or lga.deletedat:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"LGA with ID {user_data.lgaid} not found"
-            )
-        
-        # Validate region
-        region = session.get(Region, user_data.regionid)
-        if not region or region.deletedat:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Region with ID {user_data.regionid} not found"
-            )
-        
-        # Generate temp password
-        temp_password = generate_default_password()
-        salt = generate_salt()
-        encrypted_password = simple_encrypt(temp_password, salt)
-        
-        # Create user account
-        new_user = Useraccount(
-            username=username,
-            email=user_data.emailAddress,
-            passwordhash=encrypted_password,
-            salt=salt,
-            status=1,
-            isactive=False,
-            islocked=False,
-            logincount=0,
-            failedloginattempt=0,
-            lgaid=user_data.lgaid,
-            createdat=datetime.utcnow()
-        )
-        session.add(new_user)
-        session.flush()
-        
-        # Create profile
-        new_profile = Userprofile(
-            userid=new_user.userid,
-            firstname=user_data.firstname,
-            middlename=user_data.middlename,
-            lastname=user_data.lastname,
-            gender=user_data.gender,
-            email=user_data.emailAddress,
-            phonenumber=user_data.phonenumber,
-            lgaid=user_data.lgaid,
-            createdat=datetime.utcnow()
-        )
-        session.add(new_profile)
-        
-        # Create address
-        new_address = Address(
-            userid=new_user.userid,
-            streetaddress=user_data.streetaddress,
-            town=user_data.town,
-            postalcode=user_data.postalcode,
-            lgaid=user_data.lgaid,
-            latitude=user_data.latitude,
-            longitude=user_data.longitude,
-            createdat=datetime.utcnow()
-        )
-        session.add(new_address)
-        
-        # Create user-region
-        user_region = Userregion(
-            userid=new_user.userid,
-            regionid=user_data.regionid,
-            createdat=datetime.utcnow()
-        )
-        session.add(user_region)
-        
-        session.commit()
-        session.refresh(new_user)
-        
-        logger.info(f"New user created: {username}")
-        
-        # User info
-        user_info = {
-            "userid": new_user.userid,
-            "username": username,
-            "email": user_data.emailAddress
-        }
-        
-        # Email data
-        email_data = {
-            "email": user_data.emailAddress,
-            "firstname": user_data.firstname,
-            "lastname": user_data.lastname,
-            "username": username,
-            "temp_password": temp_password,
-            "lga_name": lga.lganame
-        }
-        
-        return (user_info, email_data)
-    
-    @staticmethod
-    async def get_all_users(
-        session: Session,
-        skip: int = 0,
-        limit: int = 100
-    ) -> List[Dict[str, Any]]:
-        """Get all users with profiles"""
-        users = session.exec(
-            select(Useraccount).where(Useraccount.deletedat == None).offset(skip).limit(limit)
-        ).all()
-        
-        result = []
-        for user in users:
-            profile = session.exec(
-                select(Userprofile).where(Userprofile.userid == user.userid)
-            ).first()
-            
-            result.append({
-                "userid": user.userid,
-                "username": user.username,
-                "email": user.email,
-                "status": user.status,
-                "isactive": user.isactive,
-                "islocked": user.islocked,
-                "firstname": profile.firstname if profile else None,
-                "lastname": profile.lastname if profile else None,
-                "phonenumber": profile.phonenumber if profile else None,
-                "lgaid": user.lgaid,
-                "logincount": user.logincount,
-                "lastlogindate": user.lastlogindate
-            })
-        
-        return result
-    
-    @staticmethod
-    async def get_user_by_id(user_id: int, session: Session) -> Dict[str, Any]:
-        """Get user details by ID"""
-        user = session.get(Useraccount, user_id)
+        ).first()
+
+        if not record:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired token")
+
+        user = session.get(User, record.user_id)
         if not user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+        salt = generate_salt()
+        user.salt = salt
+        user.password_hash = hash_password(new_password, salt)
+        user.last_password_change = utcnow()
+        user.failed_login_attempts = 0
+        user.is_locked = False
+        user.api_token = None  # force re-login
+        user.updated_at = utcnow()
+
+        record.is_used = True
+        record.used_at = utcnow()
+
+        session.add(user)
+        session.add(record)
+        session.commit()
+        logger.info(f"Password reset successful: {user.email}")
+        return user
+
+    @staticmethod
+    async def change_password(
+        user: User, current_password: str, new_password: str, session: Session
+    ) -> None:
+        if not verify_password(current_password, user.salt, user.password_hash):
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Current password is incorrect",
             )
-        
-        profile = session.exec(
-            select(Userprofile).where(Userprofile.userid == user_id)
+        salt = generate_salt()
+        user.salt = salt
+        user.password_hash = hash_password(new_password, salt)
+        user.last_password_change = utcnow()
+        user.api_token = None  # force re-login
+        user.updated_at = utcnow()
+        session.add(user)
+        session.commit()
+        logger.info(f"Password changed: {user.email}")
+
+    # Staff Registration
+
+    @staticmethod
+    async def register_staff(
+        req: RegisterStaffRequest,
+        tenant_id: UUID,
+        registering_user_id: UUID,
+        session: Session,
+    ) -> Tuple[User, str]:
+        """
+        Register a new staff member for a specific store within a tenant.
+        Returns (user, temp_password).
+        """
+        # Validate email uniqueness
+        if session.exec(select(User).where(User.email == req.email.lower())).first():
+            raise HTTPException(status_code=400, detail="Email already registered")
+
+        # Validate phone uniqueness
+        if req.phone and session.exec(select(User).where(User.phone == req.phone)).first():
+            raise HTTPException(status_code=400, detail="Phone number already registered")
+
+        # Validate store belongs to tenant
+        store = session.get(PharmacyStore, req.store_id)
+        if not store or store.tenant_id != tenant_id or not store.is_active:
+            raise HTTPException(status_code=404, detail="Store not found in your tenant")
+
+        # Validate role exists
+        role = session.exec(select(Role).where(Role.name == req.role_name)).first()
+        if not role:
+            raise HTTPException(status_code=404, detail=f"Role '{req.role_name}' not found")
+
+        # Generate credentials
+        temp_password = generate_temp_password()
+        salt = generate_salt()
+        password_hash = hash_password(temp_password, salt)
+
+        user = User(
+            email=req.email.lower(),
+            phone=req.phone,
+            first_name=req.first_name,
+            last_name=req.last_name,
+            middle_name=req.middle_name,
+            password_hash=password_hash,
+            salt=salt,
+            user_type=req.user_type,
+            is_active=True,
+            is_locked=False,
+        )
+        session.add(user)
+        session.flush()  # get user.id
+
+        # Assign role scoped to tenant + store
+        user_role = UserRole(
+            user_id=user.id,
+            role_id=role.id,
+            tenant_id=tenant_id,
+            store_id=req.store_id,
+            assigned_by=registering_user_id,
+        )
+        session.add(user_role)
+
+        # Create staff profile
+        staff_profile = StaffProfile(
+            user_id=user.id,
+            tenant_id=tenant_id,
+            store_id=req.store_id,
+            license_number=req.license_number,
+        )
+        session.add(staff_profile)
+
+        session.commit()
+        session.refresh(user)
+
+        logger.info(f"Staff registered: {user.email} at store {req.store_id} in tenant {tenant_id}")
+        return user, temp_password
+
+    # Role Assignment
+
+    @staticmethod
+    async def assign_role(
+        req: AssignRoleRequest,
+        tenant_id: UUID,
+        assigning_user_id: UUID,
+        session: Session,
+    ) -> UserRole:
+        user = session.get(User, req.user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        role = session.exec(select(Role).where(Role.name == req.role_name)).first()
+        if not role:
+            raise HTTPException(status_code=404, detail=f"Role '{req.role_name}' not found")
+
+        if req.store_id:
+            store = session.get(PharmacyStore, req.store_id)
+            if not store or store.tenant_id != tenant_id:
+                raise HTTPException(status_code=404, detail="Store not found in tenant")
+
+        # Upsert: check if already exists
+        existing = session.exec(
+            select(UserRole).where(
+                and_(
+                    UserRole.user_id == req.user_id,  # type: ignore
+                    UserRole.role_id == role.id,  # type: ignore
+                    UserRole.tenant_id == tenant_id,  # type: ignore
+                    UserRole.store_id == req.store_id,  # type: ignore
+                )
+            )
         ).first()
-        
-        address = session.exec(
-            select(Address).where(Address.userid == user_id)
+
+        if existing:
+            return existing
+
+        user_role = UserRole(
+            user_id=req.user_id,
+            role_id=role.id,
+            tenant_id=tenant_id,
+            store_id=req.store_id,
+            assigned_by=assigning_user_id,
+        )
+        session.add(user_role)
+        session.commit()
+        session.refresh(user_role)
+
+        logger.info(f"Role '{req.role_name}' assigned to user {req.user_id} in tenant {tenant_id}")
+        return user_role
+
+    @staticmethod
+    async def revoke_role(
+        user_id: UUID,
+        role_name: str,
+        tenant_id: UUID,
+        store_id: Optional[UUID],
+        session: Session,
+    ) -> None:
+        role = session.exec(select(Role).where(Role.name == role_name)).first()
+        if not role:
+            raise HTTPException(status_code=404, detail="Role not found")
+
+        existing = session.exec(
+            select(UserRole).where(
+                and_(
+                    UserRole.user_id == user_id,  # type: ignore
+                    UserRole.role_id == role.id,  # type: ignore
+                    UserRole.tenant_id == tenant_id,  # type: ignore
+                    UserRole.store_id == store_id,  # type: ignore
+                )
+            )
         ).first()
-        
-        user_region = session.exec(
-            select(Userregion).where(Userregion.userid == user_id)
-        ).first()
-        
-        return {
-            "userid": user.userid,
-            "username": user.username,
-            "email": user.email,
-            "status": user.status,
-            "isactive": user.isactive,
-            "islocked": user.islocked,
-            "firstname": profile.firstname if profile else None,
-            "lastname": profile.lastname if profile else None,
-            "middlename": profile.middlename if profile else None,
-            "gender": profile.gender if profile else None,
-            "phonenumber": profile.phonenumber if profile else None,
-            "designation": profile.designation if profile else None,
-            "lgaid": user.lgaid,
-            "regionid": user_region.regionid if user_region else None,
-            "streetaddress": address.streetaddress if address else None,
-            "town": address.town if address else None,
-            "postalcode": address.postalcode if address else None,
-            "latitude": address.latitude if address else None,
-            "longitude": address.longitude if address else None,
-            "logincount": user.logincount,
-            "lastlogindate": user.lastlogindate,
-            "createdat": user.createdat
-        }
+        if not existing:
+            raise HTTPException(status_code=404, detail="Role assignment not found")
+
+        session.delete(existing)
+        session.commit()
+        logger.info(f"Role '{role_name}' revoked from user {user_id}")
