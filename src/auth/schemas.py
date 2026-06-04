@@ -12,7 +12,6 @@ from src.shared.models import UserType
 
 
 # Requests
-
 class LoginRequest(BaseModel):
     """Login with email or phone."""
     identifier: str = Field(..., description="Email or phone number")

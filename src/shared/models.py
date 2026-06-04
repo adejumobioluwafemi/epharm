@@ -4,7 +4,7 @@ SQLModel ORM models — E-Pharmacy Multi-Tenant Domain
 All business tables include tenant_id; store-specific tables also include store_id.
 """
 
-from sqlmodel import SQLModel, Field, Relationship
+from sqlmodel import SQLModel, Field, Relationship, UniqueConstraint
 from typing import List, Optional
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -22,7 +22,7 @@ class UserType(str, enum.Enum):
 
 
 class RoleName(str, enum.Enum):
-    SUPER_ADMIN = "SUPER_ADMIN"       # Platform-wide admin (Anthropic-style)
+    SUPER_ADMIN = "SUPER_ADMIN"       # Platform-wide admin 
     TENANT_ADMIN = "TENANT_ADMIN"     # Pharmacy company admin (super-admin within tenant)
     STORE_MANAGER = "STORE_MANAGER"   # Branch manager
     PHARMACIST = "PHARMACIST"
@@ -129,8 +129,21 @@ class User(TimestampMixin, table=True):
     last_password_change: Optional[datetime] = Field(default=None)
 
     # Relationships
-    user_roles: List["UserRole"] = Relationship(back_populates="user")
-    staff_profile: Optional["StaffProfile"] = Relationship(back_populates="user")
+    user_roles: List["UserRole"] = Relationship(
+        back_populates="user",
+        sa_relationship_kwargs={
+            "foreign_keys": "UserRole.user_id",
+            "primaryjoin": "User.id == UserRole.user_id",
+        },
+    )
+    staff_profile: Optional["StaffProfile"] = Relationship(
+        back_populates="user",
+        sa_relationship_kwargs={
+            "foreign_keys": "StaffProfile.user_id",
+            "primaryjoin": "User.id == StaffProfile.user_id",
+            "uselist": False,
+        },
+    )
     password_reset_tokens: List["PasswordResetToken"] = Relationship(back_populates="user")
 
     @property
@@ -163,11 +176,12 @@ class UserRole(TimestampMixin, table=True):
     """
     __tablename__ = "user_roles"  # type: ignore
 
-    user_id: UUID = Field(..., foreign_key="users.id", primary_key=True)
-    role_id: UUID = Field(..., foreign_key="roles.id", primary_key=True)
-    tenant_id: UUID = Field(..., foreign_key="tenants.id", primary_key=True)
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    user_id: UUID = Field(..., foreign_key="users.id", index=True)
+    role_id: UUID = Field(..., foreign_key="roles.id", index=True)
+    tenant_id: UUID = Field(..., foreign_key="tenants.id", index=True)
     # nullable — NULL means tenant-wide scope
-    store_id: Optional[UUID] = Field(default=None, foreign_key="pharmacy_stores.id", primary_key=True)
+    store_id: Optional[UUID] = Field(default=None, foreign_key="pharmacy_stores.id", index=True)
     assigned_by: Optional[UUID] = Field(default=None, foreign_key="users.id")
     assigned_at: datetime = Field(default_factory=utcnow)
 
@@ -179,6 +193,12 @@ class UserRole(TimestampMixin, table=True):
             "primaryjoin": "UserRole.user_id == User.id",
         },
     )
+    __table_args__ = (
+       UniqueConstraint(
+           "user_id", "role_id", "tenant_id", "store_id",
+           name="uq_user_role_scope",
+       ),
+   )
     role: Optional[Role] = Relationship(back_populates="user_roles")
     tenant: Optional[Tenant] = Relationship(back_populates="user_roles")
     store: Optional[PharmacyStore] = Relationship(back_populates="user_roles")

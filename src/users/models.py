@@ -1,4 +1,7 @@
 # src/users/models.py
+"""
+FILE: src/users/models.py
+"""
 
 from sqlmodel import SQLModel, Field, Relationship
 from uuid import UUID, uuid4

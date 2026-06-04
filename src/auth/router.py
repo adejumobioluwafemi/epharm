@@ -37,7 +37,7 @@ from src.email.schemas import (
     PasswordResetEmailData,
     WelcomeEmailData,
 )
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 logger = logging.getLogger(__name__)
@@ -130,12 +130,10 @@ async def register_staff(
     Requires STORE_MANAGER, TENANT_ADMIN, or SUPER_ADMIN role.
     Sends welcome email with temporary credentials.
     """
-    tenant_id = ctx.require_tenant()
-
+    tenant_id = None if ctx.is_super_admin() else ctx.tenant_id
     user, temp_password = await AuthService.register_staff(
         req, tenant_id, ctx.user.id, session
     )
-
     # Send welcome email
     if user.email:
         welcome_data = WelcomeEmailData(
@@ -297,7 +295,7 @@ async def assign_role(
     Assign a role to a user within the current tenant (and optionally a specific store).
     Requires TENANT_ADMIN or SUPER_ADMIN.
     """
-    tenant_id = ctx.require_tenant()
+    tenant_id = None if ctx.is_super_admin() else ctx.tenant_id
     user_role = await AuthService.assign_role(req, tenant_id, ctx.user.id, session)
     return ResponseModel(
         success=True,
@@ -325,6 +323,6 @@ async def revoke_role(
     session: Session = Depends(get_session),
 ):
     """Revoke a role from a user within the current tenant."""
-    tenant_id = ctx.require_tenant()
+    tenant_id = None if ctx.is_super_admin() else ctx.tenant_id
     await AuthService.revoke_role(user_id, role_name, tenant_id, store_id, session)
     return ResponseModel(success=True, message="Role revoked successfully")

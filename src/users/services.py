@@ -150,19 +150,19 @@ class UserService:
         return user_out
 
     @staticmethod
-    async def deactivate_user(user_id: UUID, tenant_id: UUID, session: Session) -> None:
+    async def deactivate_user(user_id: UUID, tenant_id: Optional[UUID], session: Session) -> None:
         user = session.get(User, user_id)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        membership = session.exec(
-            select(UserRole).where(
-                UserRole.user_id == user_id,  # type: ignore
-                UserRole.tenant_id == tenant_id,  # type: ignore
-            )
-        ).first()
-        if not membership:
-            raise HTTPException(status_code=403, detail="User does not belong to your tenant")
-
+        if tenant_id is not None:
+            membership = session.exec(
+                select(UserRole).where(
+                    UserRole.user_id == user_id,        # type: ignore
+                    UserRole.tenant_id == tenant_id,    # type: ignore
+                )
+            ).first()
+            if not membership:
+                raise HTTPException(status_code=403, detail="User does not belong to your tenant")
         user.is_active = False
         user.updated_at = utcnow()
         session.add(user)
@@ -170,21 +170,39 @@ class UserService:
         logger.info(f"User deactivated: {user_id} in tenant {tenant_id}")
 
     @staticmethod
-    async def lock_user(user_id: UUID, tenant_id: UUID, session: Session) -> None:
+    async def lock_user(user_id: UUID, tenant_id: Optional[UUID], session: Session) -> None:
         user = session.get(User, user_id)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
+        if tenant_id is not None:
+            membership = session.exec(
+                select(UserRole).where(
+                    UserRole.user_id == user_id,        # type: ignore
+                    UserRole.tenant_id == tenant_id,    # type: ignore
+                )
+            ).first()
+            if not membership:
+                raise HTTPException(status_code=403, detail="User does not belong to your tenant")
         user.is_locked = True
-        user.api_token = None  # revoke active sessions
+        user.api_token = None
         user.updated_at = utcnow()
         session.add(user)
         session.commit()
 
     @staticmethod
-    async def unlock_user(user_id: UUID, tenant_id: UUID, session: Session) -> None:
+    async def unlock_user(user_id: UUID, tenant_id: Optional[UUID], session: Session) -> None:
         user = session.get(User, user_id)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
+        if tenant_id is not None:
+            membership = session.exec(
+                select(UserRole).where(
+                    UserRole.user_id == user_id,        # type: ignore
+                    UserRole.tenant_id == tenant_id,    # type: ignore
+                )
+            ).first()
+            if not membership:
+                raise HTTPException(status_code=403, detail="User does not belong to your tenant")
         user.is_locked = False
         user.failed_login_attempts = 0
         user.updated_at = utcnow()
@@ -287,15 +305,19 @@ class StoreService:
     @staticmethod
     async def get_store(store_id: UUID, tenant_id: UUID, session: Session) -> PharmacyStore:
         store = session.get(PharmacyStore, store_id)
-        if not store or store.tenant_id != tenant_id or store.deleted_at:
+        if not store or store.deleted_at:
             raise HTTPException(status_code=404, detail="Store not found")
+        if store.tenant_id != tenant_id:
+            raise HTTPException(status_code=403, detail="Store does not belong to your tenant")
         return store
 
     @staticmethod
-    async def deactivate_store(store_id: UUID, tenant_id: UUID, session: Session) -> None:
+    async def deactivate_store(store_id: UUID, tenant_id: Optional[UUID], session: Session) -> None:
         store = session.get(PharmacyStore, store_id)
-        if not store or store.tenant_id != tenant_id:
+        if not store or store.deleted_at:
             raise HTTPException(status_code=404, detail="Store not found")
+        if tenant_id is not None and store.tenant_id != tenant_id:
+            raise HTTPException(status_code=403, detail="Store does not belong to your tenant")
         store.is_active = False
         store.updated_at = utcnow()
         session.add(store)

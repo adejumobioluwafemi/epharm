@@ -54,12 +54,18 @@ BCRYPT_REFRESH_HASH = hashlib.sha256  # used to hash raw refresh tokens before D
 def _hash_token(raw: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
-
 class AuthService:
     """All authentication and token business logic."""
 
     # User lookup helpers 
-
+    @staticmethod
+    def _normalize_role_name(role_name) -> str:
+        """Accept a RoleName enum, 'RoleName.CASHIER', or 'CASHIER' → 'CASHIER'."""
+        s = str(role_name)
+        if "." in s:
+            s = s.rsplit(".", 1)[-1]
+        return s
+    
     @staticmethod
     def _find_user_by_identifier(identifier: str, session: Session) -> Optional[User]:
         """Find user by email or phone."""
@@ -414,29 +420,27 @@ class AuthService:
     @staticmethod
     async def register_staff(
         req: RegisterStaffRequest,
-        tenant_id: UUID,
+        tenant_id: Optional[UUID],
         registering_user_id: UUID,
         session: Session,
     ) -> Tuple[User, str]:
-        """
-        Register a new staff member for a specific store within a tenant.
-        Returns (user, temp_password).
-        """
-        # Validate email uniqueness
         if session.exec(select(User).where(User.email == req.email.lower())).first():
             raise HTTPException(status_code=400, detail="Email already registered")
-
-        # Validate phone uniqueness
         if req.phone and session.exec(select(User).where(User.phone == req.phone)).first():
             raise HTTPException(status_code=400, detail="Phone number already registered")
 
-        # Validate store belongs to tenant
         store = session.get(PharmacyStore, req.store_id)
-        if not store or store.tenant_id != tenant_id or not store.is_active:
+        if not store or not store.is_active:
+            raise HTTPException(status_code=404, detail="Store not found in your tenant")
+        # SUPER_ADMIN (no tenant context) inherits the store's tenant; others must match
+        if tenant_id is None:
+            tenant_id = store.tenant_id
+        elif store.tenant_id != tenant_id:
             raise HTTPException(status_code=404, detail="Store not found in your tenant")
 
-        # Validate role exists
-        role = session.exec(select(Role).where(Role.name == req.role_name)).first()
+        role = session.exec(
+            select(Role).where(Role.name == AuthService._normalize_role_name(req.role_name))
+        ).first()
         if not role:
             raise HTTPException(status_code=404, detail=f"Role '{req.role_name}' not found")
 
@@ -463,7 +467,7 @@ class AuthService:
         # Assign role scoped to tenant + store
         user_role = UserRole(
             user_id=user.id,
-            role_id=role.id,
+            role_id=role.id, # type: ignore
             tenant_id=tenant_id,
             store_id=req.store_id,
             assigned_by=registering_user_id,
@@ -490,7 +494,7 @@ class AuthService:
     @staticmethod
     async def assign_role(
         req: AssignRoleRequest,
-        tenant_id: UUID,
+        tenant_id: Optional[UUID],
         assigning_user_id: UUID,
         session: Session,
     ) -> UserRole:
@@ -498,27 +502,34 @@ class AuthService:
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        role = session.exec(select(Role).where(Role.name == req.role_name)).first()
+        role = session.exec(
+            select(Role).where(Role.name == AuthService._normalize_role_name(req.role_name))
+        ).first()
         if not role:
             raise HTTPException(status_code=404, detail=f"Role '{req.role_name}' not found")
 
         if req.store_id:
             store = session.get(PharmacyStore, req.store_id)
-            if not store or store.tenant_id != tenant_id:
+            if not store:
+                raise HTTPException(status_code=404, detail="Store not found in tenant")
+            if tenant_id is None:
+                tenant_id = store.tenant_id
+            elif store.tenant_id != tenant_id:
                 raise HTTPException(status_code=404, detail="Store not found in tenant")
 
-        # Upsert: check if already exists
+        if tenant_id is None:
+            raise HTTPException(status_code=400, detail="tenant_id required for tenant-wide assignment")
+
         existing = session.exec(
             select(UserRole).where(
                 and_(
-                    UserRole.user_id == req.user_id,  # type: ignore
-                    UserRole.role_id == role.id,  # type: ignore
-                    UserRole.tenant_id == tenant_id,  # type: ignore
-                    UserRole.store_id == req.store_id,  # type: ignore
+                    UserRole.user_id == req.user_id,     # type: ignore
+                    UserRole.role_id == role.id,         # type: ignore
+                    UserRole.tenant_id == tenant_id,     # type: ignore
+                    UserRole.store_id == req.store_id,   # type: ignore
                 )
             )
         ).first()
-
         if existing:
             return existing
 
@@ -532,35 +543,34 @@ class AuthService:
         session.add(user_role)
         session.commit()
         session.refresh(user_role)
-
-        logger.info(f"Role '{req.role_name}' assigned to user {req.user_id} in tenant {tenant_id}")
+        logger.info(f"Role assigned to user {req.user_id} in tenant {tenant_id}")
         return user_role
 
     @staticmethod
     async def revoke_role(
         user_id: UUID,
         role_name: str,
-        tenant_id: UUID,
+        tenant_id: Optional[UUID],
         store_id: Optional[UUID],
         session: Session,
     ) -> None:
-        role = session.exec(select(Role).where(Role.name == role_name)).first()
+        role = session.exec(
+            select(Role).where(Role.name == AuthService._normalize_role_name(role_name))
+        ).first()
         if not role:
             raise HTTPException(status_code=404, detail="Role not found")
 
-        existing = session.exec(
-            select(UserRole).where(
-                and_(
-                    UserRole.user_id == user_id,  # type: ignore
-                    UserRole.role_id == role.id,  # type: ignore
-                    UserRole.tenant_id == tenant_id,  # type: ignore
-                    UserRole.store_id == store_id,  # type: ignore
-                )
-            )
-        ).first()
+        conditions = [
+            UserRole.user_id == user_id,      # type: ignore
+            UserRole.role_id == role.id,      # type: ignore
+            UserRole.store_id == store_id,    # type: ignore
+        ]
+        if tenant_id is not None:             # SUPER_ADMIN may omit tenant scope
+            conditions.append(UserRole.tenant_id == tenant_id)  # type: ignore
+
+        existing = session.exec(select(UserRole).where(and_(*conditions))).first() # type: ignore
         if not existing:
             raise HTTPException(status_code=404, detail="Role assignment not found")
-
         session.delete(existing)
         session.commit()
         logger.info(f"Role '{role_name}' revoked from user {user_id}")

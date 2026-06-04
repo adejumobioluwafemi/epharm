@@ -112,7 +112,7 @@ async def deactivate_user(
     ctx: TenantContext = Depends(),
     session: Session = Depends(get_session),
 ):
-    tenant_id = ctx.require_tenant()
+    tenant_id = None if ctx.is_super_admin() else ctx.tenant_id
     await UserService.deactivate_user(user_id, tenant_id, session)
     return ResponseModel(success=True, message="User deactivated")
 
@@ -127,7 +127,7 @@ async def lock_user(
     ctx: TenantContext = Depends(),
     session: Session = Depends(get_session),
 ):
-    tenant_id = ctx.require_tenant()
+    tenant_id = None if ctx.is_super_admin() else ctx.tenant_id
     await UserService.lock_user(user_id, tenant_id, session)
     return ResponseModel(success=True, message="User locked")
 
@@ -142,7 +142,7 @@ async def unlock_user(
     ctx: TenantContext = Depends(),
     session: Session = Depends(get_session),
 ):
-    tenant_id = ctx.require_tenant()
+    tenant_id = None if ctx.is_super_admin() else ctx.tenant_id
     await UserService.unlock_user(user_id, tenant_id, session)
     return ResponseModel(success=True, message="User unlocked")
 
@@ -269,7 +269,7 @@ async def deactivate_store(
     ctx: TenantContext = Depends(),
     session: Session = Depends(get_session),
 ):
-    tenant_id = ctx.require_tenant()
+    tenant_id = None if ctx.is_super_admin() else ctx.tenant_id
     await StoreService.deactivate_store(store_id, tenant_id, session)
     return ResponseModel(success=True, message="Store deactivated")
 

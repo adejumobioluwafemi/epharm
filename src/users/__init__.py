@@ -1,6 +1,6 @@
 """
-FILE: src/auth/__init__.py
-Authentication module initialization
+FILE: src/users/__init__.py
+Users module initialization
 """
 from src.users.router import router
 

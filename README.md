@@ -169,6 +169,15 @@ python main.py
 Open `http://localhost:8000/docs`
 
 ---
+## Test
+
+```bash
+
+pytest tests/ -v --cov=src --cov-report=html
+
+pytest tests/ -v --cov=src --cov-report=html &> output.txt
+```
+---
 
 ## Week 1 Deliverables ✅
 - [x] FastAPI project initialized
