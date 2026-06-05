@@ -94,12 +94,17 @@ def client_fixture(session: Session):
 # ROLE FIXTURES
 # ============================================================================
 
-def _get_or_create_role(session: Session, name: str, description: str) -> Role:
-    """Return existing role or create and flush a new one."""
-    existing = session.exec(select(Role).where(Role.name == name)).first()
+def _get_or_create_role(session: Session, name, description: str) -> Role:
+    """Return existing role or create and flush a new one.
+
+    Accepts a RoleName enum or a string; persists the plain string value
+    so Role.name matches what seed.py writes and what the JWT roles list expects.
+    """
+    role_name = name.value if hasattr(name, "value") else name
+    existing = session.exec(select(Role).where(Role.name == role_name)).first()
     if existing:
         return existing
-    role = Role(name=name, description=description)
+    role = Role(name=role_name, description=description)
     session.add(role)
     session.flush()
     return role
@@ -346,7 +351,6 @@ def _assign_role(
     session.flush()
     return user_role
 
-
 def _create_token(
     session: Session,
     user: User,
@@ -356,7 +360,7 @@ def _create_token(
 ) -> str:
     """Create a JWT access token, persist it in user.api_token, and return the raw token."""
     store_ids = store_ids or []
-    roles = roles or []
+    roles = [r.value if hasattr(r, "value") else r for r in (roles or [])]
     access_token = create_access_token(
         user_id=user.id,
         email=user.email,

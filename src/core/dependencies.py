@@ -4,6 +4,7 @@ FastAPI dependencies — tenant-aware authentication & RBAC
 """
 
 from fastapi import Depends, HTTPException, status, Header, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlmodel import Session, select
 from typing import List, Optional
 from uuid import UUID
@@ -16,6 +17,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+bearer_scheme = HTTPBearer(auto_error=False)
 # Token extraction 
 
 def _extract_token(authorization: Optional[str]) -> str:
@@ -37,6 +39,70 @@ def _extract_token(authorization: Optional[str]) -> str:
 # Current user 
 
 async def get_current_user(
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    session: Session = Depends(get_session),
+) -> User:
+    """
+    Validate Bearer token and return the authenticated User.
+    Raises 401 on invalid token, 403 on locked/inactive account.
+    """
+    if creds is None or not creds.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    token = creds.credentials  # bare token, no "Bearer " prefix
+    payload = decode_access_token(token)
+
+    if not payload:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+
+    user_id_str = payload.get("sub")
+    if not user_id_str:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload",
+        )
+
+    try:
+        user_id = UUID(user_id_str)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload",
+        )
+
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is deactivated",
+        )
+
+    if user.is_locked:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is locked. Contact your administrator.",
+        )
+
+    # Token revocation check — stored token must match
+    if user.api_token != token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked. Please log in again.",
+        )
+
+    return user
+
+async def get_current_user_old(
     authorization: Optional[str] = Header(None),
     session: Session = Depends(get_session),
 ) -> User:
@@ -95,7 +161,6 @@ async def get_current_user(
 
     return user
 
-
 async def get_current_active_user(
     current_user: User = Depends(get_current_user),
 ) -> User:
@@ -138,6 +203,20 @@ class TenantContext:
     """
 
     def __init__(
+        self,
+        creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+        current_user: User = Depends(get_current_user),
+    ):
+        self.user = current_user
+        token = creds.credentials if creds else ""
+        payload = decode_access_token(token) or {}
+        tenant_id_str = payload.get("tenant_id")
+        store_ids_str: List[str] = payload.get("store_ids", [])
+        self.roles: List[str] = payload.get("roles", [])
+        self.tenant_id: Optional[UUID] = UUID(tenant_id_str) if tenant_id_str else None
+        self.store_ids: List[UUID] = [UUID(s) for s in store_ids_str if s]
+
+    def __init__old(
         self,
         authorization: Optional[str] = Header(None),
         current_user: User = Depends(get_current_user),

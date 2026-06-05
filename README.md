@@ -177,6 +177,10 @@ pytest tests/ -v --cov=src --cov-report=html
 
 pytest tests/ -v --cov=src --cov-report=html &> output.txt
 ```
+
+INFO:__main__:  ✓ Super admin created: superadmin@epharmacy.com  |  password: lJSgF0tykLCc#S3W
+INFO:__main__:  ✓ Tenant admin created: admin@demopharmacy.com  |  password: k4cCB740aiN1
+INFO:__main__:  ✓ Store manager created: manager@demopharmacy.com  |  password: J#mXuzd6KHx3
 ---
 
 ## Week 1 Deliverables ✅
