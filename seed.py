@@ -1,6 +1,7 @@
 """
 FILE: seed.py
-Database seeder — roles, super admin, demo tenant, demo store
+Database seeder — roles, super admin, demo tenant, demo store, and at least
+two users for every role type.
 Run: python seed.py
 """
 import sys
@@ -40,6 +41,22 @@ ROLES = [
     {"name": RoleName.RIDER, "description": "Delivery rider"},
     {"name": RoleName.PATIENT, "description": "Patient / customer"},
 ]
+
+# ─── How each role is scoped & what user_type it maps to ──────────────────────
+# tenant_wide=True  → UserRole.store_id is NULL (role applies to whole tenant)
+# tenant_wide=False → UserRole.store_id is set  (role scoped to a store)
+# staff_profile=True → also create a StaffProfile row (staff-type users only)
+ROLE_SEED_PLAN = {
+    RoleName.TENANT_ADMIN:   {"user_type": UserType.STAFF,   "tenant_wide": True,  "staff_profile": True},
+    RoleName.STORE_MANAGER:  {"user_type": UserType.STAFF,   "tenant_wide": False, "staff_profile": True},
+    RoleName.PHARMACIST:     {"user_type": UserType.STAFF,   "tenant_wide": False, "staff_profile": True},
+    RoleName.CASHIER:        {"user_type": UserType.STAFF,   "tenant_wide": False, "staff_profile": True},
+    RoleName.INVENTORY_CLERK:{"user_type": UserType.STAFF,   "tenant_wide": False, "staff_profile": True},
+    RoleName.RIDER:          {"user_type": UserType.RIDER,   "tenant_wide": False, "staff_profile": False},
+    RoleName.PATIENT:        {"user_type": UserType.PATIENT, "tenant_wide": True,  "staff_profile": False},
+}
+
+USERS_PER_ROLE = 2  # seed at least two of each role
 
 
 # ─── Seeders ──────────────────────────────────────────────────────────────────
@@ -85,59 +102,102 @@ def seed_platform_tenant(session: Session) -> Tenant:
     return tenant
 
 
-def seed_super_admin(session: Session, role_map: dict, platform_tenant: Tenant) -> User:
-    """Create the platform SUPER_ADMIN user and assign the SUPER_ADMIN role.
+def _create_staff_user(
+    session: Session,
+    *,
+    email: str,
+    first_name: str,
+    last_name: str,
+    phone: str,
+    user_type: UserType,
+    password_env: str = None,  # type: ignore
+) -> tuple[User, str]:
+    """Create a user (idempotent by email). Returns (user, password_or_marker).
 
-    The role is scoped to the platform tenant purely to satisfy the
-    UserRole.tenant_id FK constraint. Tenant-scoping bypass for SUPER_ADMIN is
-    driven by the SUPER_ADMIN *role* (TenantContext.is_super_admin()), not by the
-    tenant_id carried in the JWT, so this binding does not restrict the account.
+    If the user already exists, returns ("__exists__") as the password marker so
+    the caller knows not to re-log a fresh credential.
     """
-    email = os.getenv("SUPER_ADMIN_EMAIL", "superadmin@epharmacy.com")
-    password = os.getenv("SUPER_ADMIN_PASSWORD", generate_temp_password(16))
+    existing = session.exec(select(User).where(User.email == email)).first()
+    if existing:
+        return existing, "__exists__"
 
-    user = session.exec(select(User).where(User.email == email)).first()
-    if user:
-        logger.info(f"  ✓ Super admin already exists: {email}")
-    else:
-        salt = generate_salt()
-        user = User(
-            email=email,
-            phone=os.getenv("SUPER_ADMIN_PHONE", "+2348000000000"),
-            first_name="Platform",
-            last_name="Admin",
-            password_hash=hash_password(password, salt),
-            salt=salt,
-            user_type=UserType.SUPER_ADMIN,
-            is_active=True,
-            is_locked=False,
-        )
-        session.add(user)
-        session.flush()
-        logger.info(f"  ✓ Super admin created: {email}  |  password: {password}")
+    password = (os.getenv(password_env) if password_env else None) or generate_temp_password(12)
+    salt = generate_salt()
+    user = User(
+        email=email,
+        phone=phone,
+        first_name=first_name,
+        last_name=last_name,
+        password_hash=hash_password(password, salt),
+        salt=salt,
+        user_type=user_type,
+        is_active=True,
+        is_locked=False,
+    )
+    session.add(user)
+    session.flush()
+    return user, password
 
-    # Assign SUPER_ADMIN role (idempotent) — scoped to platform tenant, no store
-    sa_role = role_map[RoleName.SUPER_ADMIN]
-    existing_role = session.exec(
+
+def _assign_role(
+    session: Session,
+    user: User,
+    role: Role,
+    tenant: Tenant,
+    store: PharmacyStore = None,  # type: ignore
+) -> None:
+    """Idempotently assign a role to a user, scoped to tenant (+ optional store)."""
+    store_id = store.id if store else None
+    existing = session.exec(
         select(UserRole).where(
             and_(
                 UserRole.user_id == user.id,        # type: ignore
-                UserRole.role_id == sa_role.id,     # type: ignore
+                UserRole.role_id == role.id,        # type: ignore
+                UserRole.tenant_id == tenant.id,    # type: ignore
+                UserRole.store_id == store_id,      # type: ignore
             )
         )
     ).first()
-    if not existing_role:
-        session.add(
-            UserRole(
-                user_id=user.id,
-                role_id=sa_role.id,
-                tenant_id=platform_tenant.id,
-                store_id=None,
-            )
+    if existing:
+        return
+    session.add(
+        UserRole(
+            user_id=user.id,
+            role_id=role.id,
+            tenant_id=tenant.id,
+            store_id=store_id,
         )
-        logger.info("  ✓ SUPER_ADMIN role assigned")
+    )
 
-    return user
+
+def seed_super_admins(session: Session, role_map: dict, platform_tenant: Tenant) -> None:
+    """Create at least two platform SUPER_ADMIN users."""
+    sa_role = role_map[RoleName.SUPER_ADMIN]
+    for i in range(1, USERS_PER_ROLE + 1):
+        # Keep the first super admin on the well-known email / env override.
+        if i == 1:
+            email = os.getenv("SUPER_ADMIN_EMAIL", "superadmin@epharmacy.com")
+            phone = os.getenv("SUPER_ADMIN_PHONE", "+2348000000000")
+            password_env = "SUPER_ADMIN_PASSWORD"
+        else:
+            email = f"superadmin{i}@epharmacy.com"
+            phone = f"+234800000000{i}"
+            password_env = None  # type: ignore
+
+        user, password = _create_staff_user(
+            session,
+            email=email,
+            first_name="Platform",
+            last_name=f"Admin {i}",
+            phone=phone,
+            user_type=UserType.SUPER_ADMIN,
+            password_env=password_env, # type: ignore
+        )
+        _assign_role(session, user, sa_role, platform_tenant)  # tenant-wide, no store
+        if password == "__exists__":
+            logger.info(f"  ✓ Super admin already exists: {email}")
+        else:
+            logger.info(f"  ✓ Super admin created: {email}  |  password: {password}")
 
 
 def seed_demo_tenant(session: Session) -> Tenant:
@@ -161,131 +221,93 @@ def seed_demo_tenant(session: Session) -> Tenant:
     return tenant
 
 
-def seed_demo_store(session: Session, tenant: Tenant) -> PharmacyStore:
-    """Create a demo branch for the demo tenant."""
-    existing = session.exec(
-        select(PharmacyStore).where(
-            and_(
-                PharmacyStore.tenant_id == tenant.id,  # type: ignore
-                PharmacyStore.name == "Main Branch",   # type: ignore
+def seed_demo_stores(session: Session, tenant: Tenant) -> list[PharmacyStore]:
+    """Create two demo branches for the demo tenant. Returns [main, second]."""
+    wanted = [
+        {
+            "name": "Main Branch",
+            "address": "123 Health Avenue",
+            "city": "Lagos", "state": "Lagos", "postal_code": "100001",
+            "phone": "+2348012345678", "email": "mainbranch@demopharmacy.com",
+            "latitude": 6.5244, "longitude": 3.3792,
+        },
+        {
+            "name": "Ikeja Branch",
+            "address": "45 Airport Road, Ikeja",
+            "city": "Lagos", "state": "Lagos", "postal_code": "100211",
+            "phone": "+2348012345679", "email": "ikeja@demopharmacy.com",
+            "latitude": 6.6018, "longitude": 3.3515,
+        },
+    ]
+    stores: list[PharmacyStore] = []
+    for s in wanted:
+        existing = session.exec(
+            select(PharmacyStore).where(
+                and_(
+                    PharmacyStore.tenant_id == tenant.id,  # type: ignore
+                    PharmacyStore.name == s["name"],       # type: ignore
+                )
             )
-        )
-    ).first()
-    if existing:
-        logger.info("  ✓ Demo store already exists: Main Branch")
-        return existing
-    store = PharmacyStore(
-        tenant_id=tenant.id,
-        name="Main Branch",
-        address="123 Health Avenue",
-        city="Lagos",
-        state="Lagos",
-        postal_code="100001",
-        phone="+2348012345678",
-        email="mainbranch@demopharmacy.com",
-        latitude=6.5244,    # type: ignore
-        longitude=3.3792,   # type: ignore
-    )
-    session.add(store)
-    session.flush()
-    logger.info(f"  ✓ Demo store created: {store.name}")
-    return store
+        ).first()
+        if existing:
+            logger.info(f"  ✓ Demo store already exists: {s['name']}")
+            stores.append(existing)
+            continue
+        store = PharmacyStore(tenant_id=tenant.id, **s)  # type: ignore
+        session.add(store)
+        session.flush()
+        logger.info(f"  ✓ Demo store created: {store.name}")
+        stores.append(store)
+    return stores
 
 
-def seed_tenant_admin(
-    session: Session, tenant: Tenant, store: PharmacyStore, role_map: dict
-) -> User:
-    """Create a TENANT_ADMIN for the demo tenant (tenant-wide role, no store)."""
-    email = "admin@demopharmacy.com"
-    password = os.getenv("DEMO_ADMIN_PASSWORD", generate_temp_password(12))
+def seed_role_users(
+    session: Session,
+    role_map: dict,
+    tenant: Tenant,
+    stores: list[PharmacyStore],
+) -> None:
+    """Seed at least two users for each non-super-admin role, per ROLE_SEED_PLAN.
 
-    user = session.exec(select(User).where(User.email == email)).first()
-    if user:
-        logger.info(f"  ✓ Tenant admin already exists: {email}")
-        return user
+    Store-scoped roles are spread across the available stores so the two users
+    don't all land on the same branch.
+    """
+    for role_name, plan in ROLE_SEED_PLAN.items():
+        role = role_map[role_name]
+        slug = role_name.value.lower()  # e.g. "pharmacist"
+        for i in range(1, USERS_PER_ROLE + 1):
+            email = f"{slug}{i}@demopharmacy.com"
+            # Distribute store-scoped users round-robin across stores.
+            store = None if plan["tenant_wide"] else stores[(i - 1) % len(stores)]
 
-    salt = generate_salt()
-    user = User(
-        email=email,
-        phone="+2348011111111",
-        first_name="Demo",
-        last_name="Admin",
-        password_hash=hash_password(password, salt),
-        salt=salt,
-        user_type=UserType.STAFF,
-        is_active=True,
-        is_locked=False,
-    )
-    session.add(user)
-    session.flush()
+            user, password = _create_staff_user(
+                session,
+                email=email,
+                first_name=role_name.value.replace("_", " ").title(),
+                last_name=f"User {i}",
+                phone=f"+23480{abs(hash(email)) % 100000000:08d}",
+                user_type=plan["user_type"],
+            )
+            _assign_role(session, user, role, tenant, store) # type: ignore
 
-    session.add(
-        UserRole(
-            user_id=user.id,
-            role_id=role_map[RoleName.TENANT_ADMIN].id,
-            tenant_id=tenant.id,
-            store_id=None,  # tenant-wide
-        )
-    )
-    session.add(
-        StaffProfile(
-            user_id=user.id,
-            tenant_id=tenant.id,
-            store_id=store.id,
-            verified=True,
-            verified_at=utcnow(),
-        )
-    )
-    logger.info(f"  ✓ Tenant admin created: {email}  |  password: {password}")
-    return user
+            if plan["staff_profile"] and password != "__exists__":
+                # StaffProfile requires a concrete store; tenant-wide staff (tenant
+                # admin) get attached to the first store for profile purposes.
+                profile_store = store or stores[0]
+                session.add(
+                    StaffProfile(
+                        user_id=user.id,
+                        tenant_id=tenant.id,
+                        store_id=profile_store.id,
+                        verified=True,
+                        verified_at=utcnow(),
+                    )
+                )
 
-
-def seed_demo_store_manager(
-    session: Session, tenant: Tenant, store: PharmacyStore, role_map: dict
-) -> User:
-    """Create a STORE_MANAGER scoped to the main branch."""
-    email = "manager@demopharmacy.com"
-    password = os.getenv("DEMO_MANAGER_PASSWORD", generate_temp_password(12))
-
-    user = session.exec(select(User).where(User.email == email)).first()
-    if user:
-        logger.info(f"  ✓ Store manager already exists: {email}")
-        return user
-
-    salt = generate_salt()
-    user = User(
-        email=email,
-        phone="+2348022222222",
-        first_name="Branch",
-        last_name="Manager",
-        password_hash=hash_password(password, salt),
-        salt=salt,
-        user_type=UserType.STAFF,
-        is_active=True,
-        is_locked=False,
-    )
-    session.add(user)
-    session.flush()
-
-    session.add(
-        UserRole(
-            user_id=user.id,
-            role_id=role_map[RoleName.STORE_MANAGER].id,
-            tenant_id=tenant.id,
-            store_id=store.id,  # store-scoped
-        )
-    )
-    session.add(
-        StaffProfile(
-            user_id=user.id,
-            tenant_id=tenant.id,
-            store_id=store.id,
-            verified=True,
-            verified_at=utcnow(),
-        )
-    )
-    logger.info(f"  ✓ Store manager created: {email}  |  password: {password}")
-    return user
+            if password == "__exists__":
+                logger.info(f"  ✓ {role_name.value} already exists: {email}")
+            else:
+                logger.info(f"  ✓ {role_name.value} created: {email}  |  password: {password}")
 
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
@@ -301,28 +323,27 @@ def main():
         platform_tenant = seed_platform_tenant(session)
         session.commit()
 
-        logger.info("\n👤 Seeding super admin...")
-        seed_super_admin(session, role_map, platform_tenant)
+        logger.info("\n👤 Seeding super admins...")
+        seed_super_admins(session, role_map, platform_tenant)
         session.commit()
 
-        logger.info("\n🏪 Seeding demo tenant & store...")
+        logger.info("\n🏪 Seeding demo tenant & stores...")
         demo_tenant = seed_demo_tenant(session)
         session.commit()
-        demo_store = seed_demo_store(session, demo_tenant)
+        demo_stores = seed_demo_stores(session, demo_tenant)
         session.commit()
 
-        logger.info("\n👥 Seeding demo users...")
-        seed_tenant_admin(session, demo_tenant, demo_store, role_map)
-        seed_demo_store_manager(session, demo_tenant, demo_store, role_map)
+        logger.info("\n👥 Seeding two users per role...")
+        seed_role_users(session, role_map, demo_tenant, demo_stores)
         session.commit()
 
     logger.info("\n✅ Seeding complete!")
     logger.info("─" * 50)
-    logger.info("Demo credentials:")
-    logger.info("  Super Admin  : superadmin@epharmacy.com")
-    logger.info("  Tenant Admin : admin@demopharmacy.com")
-    logger.info("  Store Manager: manager@demopharmacy.com")
-    logger.info("  (Passwords printed above or in .env)")
+    logger.info("Seeded at least two users per role under the demo tenant.")
+    logger.info("Login emails follow the pattern <role>1@demopharmacy.com / <role>2@demopharmacy.com")
+    logger.info("  e.g. pharmacist1@demopharmacy.com, cashier2@demopharmacy.com")
+    logger.info("Super admins: superadmin@epharmacy.com, superadmin2@epharmacy.com")
+    logger.info("(Generated passwords are printed above; set *_PASSWORD env vars to pin them.)")
 
 
 if __name__ == "__main__":

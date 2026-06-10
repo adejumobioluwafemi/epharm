@@ -178,9 +178,23 @@ pytest tests/ -v --cov=src --cov-report=html
 pytest tests/ -v --cov=src --cov-report=html &> output.txt
 ```
 
-INFO:__main__:  ✓ Super admin created: superadmin@epharmacy.com  |  password: lJSgF0tykLCc#S3W
-INFO:__main__:  ✓ Tenant admin created: admin@demopharmacy.com  |  password: k4cCB740aiN1
-INFO:__main__:  ✓ Store manager created: manager@demopharmacy.com  |  password: J#mXuzd6KHx3
+INFO:__main__:  ✓ Super admin created: superadmin@epharmacy.com  |  password: !q3BxnAkZVuF
+INFO:__main__:  ✓ Super admin created: superadmin2@epharmacy.com  |  password: aRUhQ1aDa7wl
+
+INFO:__main__:  ✓ TENANT_ADMIN created: tenant_admin1@demopharmacy.com  |  password: k9gLfitddwRK
+INFO:__main__:  ✓ TENANT_ADMIN created: tenant_admin2@demopharmacy.com  |  password: igDrmDdEkMfG
+INFO:__main__:  ✓ STORE_MANAGER created: store_manager1@demopharmacy.com  |  password: tID6n!ndIOfd
+INFO:__main__:  ✓ STORE_MANAGER created: store_manager2@demopharmacy.com  |  password: #Xk3Hrpu20pn
+INFO:__main__:  ✓ PHARMACIST created: pharmacist1@demopharmacy.com  |  password: 6KQPjE6B6k9y
+INFO:__main__:  ✓ PHARMACIST created: pharmacist2@demopharmacy.com  |  password: JNOiaZG3s8w6
+INFO:__main__:  ✓ CASHIER created: cashier1@demopharmacy.com  |  password: 3QzHMGyDBOFx
+INFO:__main__:  ✓ CASHIER created: cashier2@demopharmacy.com  |  password: dzTE3O!arj@n
+INFO:__main__:  ✓ INVENTORY_CLERK created: inventory_clerk1@demopharmacy.com  |  password: JcxPmd9iqopi
+INFO:__main__:  ✓ INVENTORY_CLERK created: inventory_clerk2@demopharmacy.com  |  password: LS1okeyc9gcC
+INFO:__main__:  ✓ RIDER created: rider1@demopharmacy.com  |  password: ChAUTWtsOuRO
+INFO:__main__:  ✓ RIDER created: rider2@demopharmacy.com  |  password: fla2rMn@X96B
+INFO:__main__:  ✓ PATIENT created: patient1@demopharmacy.com  |  password: ONtVrb2a1@og
+INFO:__main__:  ✓ PATIENT created: patient2@demopharmacy.com  |  password: Z5LSp3X8t107
 ---
 
 ## Week 1 Deliverables ✅
